@@ -66,6 +66,11 @@ module EventMachine
     def release_machine
     end
 
+
+    def stopping?
+      return Reactor.instance.stop_scheduled
+    end
+
     # @private
     def stop
       Reactor.instance.stop
@@ -273,7 +278,7 @@ module EventMachine
 
     HeartbeatInterval = 2
 
-    attr_reader :current_loop_time
+    attr_reader :current_loop_time, :stop_scheduled
 
     def initialize
       initialize_for_run
@@ -393,7 +398,7 @@ module EventMachine
       100.times {
         @loopbreak_port = rand(10000) + 40000
         begin
-          @loopbreak_reader.bind "localhost", @loopbreak_port
+          @loopbreak_reader.bind "127.0.0.1", @loopbreak_port
           bound = true
           break
         rescue
@@ -410,7 +415,7 @@ module EventMachine
 
     def signal_loopbreak
       #@loopbreak_writer.write '+' if @loopbreak_writer
-      @loopbreak_writer.send('+',0,"localhost",@loopbreak_port) if @loopbreak_writer
+      @loopbreak_writer.send('+',0,"127.0.0.1",@loopbreak_port) if @loopbreak_writer
     end
 
     def set_timer_quantum interval_in_seconds

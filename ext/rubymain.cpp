@@ -25,6 +25,26 @@ See the file COPYING for complete licensing information.
 #define RFLOAT_VALUE(arg) RFLOAT(arg)->value
 #endif
 
+/* Adapted from NUM2BSIG / BSIG2NUM in ext/fiddle/conversions.h,
+ * we'll call it a BSIG for Binding Signature here. */
+#if SIZEOF_VOIDP == SIZEOF_LONG
+# define BSIG2NUM(x)   (ULONG2NUM((unsigned long)(x)))
+# define NUM2BSIG(x)   (NUM2ULONG(x))
+# ifdef OS_WIN32
+#  define PRIFBSIG      "I32u"
+# else
+#  define PRIFBSIG      "lu"
+# endif
+#else
+# define BSIG2NUM(x)   (ULL2NUM((unsigned long long)(x)))
+# define NUM2BSIG(x)   (NUM2ULL(x))
+# ifdef OS_WIN32
+#  define PRIFBSIG      "I64u"
+# else
+#  define PRIFBSIG      "llu"
+# endif
+#endif
+
 /*******
 Statics
 *******/
@@ -47,6 +67,7 @@ static VALUE Intern_event_callback;
 static VALUE Intern_run_deferred_callbacks;
 static VALUE Intern_delete;
 static VALUE Intern_call;
+static VALUE Intern_at;
 static VALUE Intern_receive_data;
 static VALUE Intern_ssl_handshake_completed;
 static VALUE Intern_ssl_verify_peer;
@@ -59,17 +80,17 @@ static VALUE Intern_connection_completed;
 static VALUE rb_cProcStatus;
 
 struct em_event {
-	unsigned long signature;
+	uintptr_t signature;
 	int event;
 	const char *data_str;
 	unsigned long data_num;
 };
 
-static inline VALUE ensure_conn(const unsigned long signature)
+static inline VALUE ensure_conn(const uintptr_t signature)
 {
-	VALUE conn = rb_hash_aref (EmConnsHash, ULONG2NUM (signature));
+	VALUE conn = rb_hash_aref (EmConnsHash, BSIG2NUM (signature));
 	if (conn == Qnil)
-		rb_raise (EM_eConnectionNotBound, "unknown connection: %lu", signature);
+		rb_raise (EM_eConnectionNotBound, "unknown connection: %" PRIFBSIG, signature);
 	return conn;
 }
 
@@ -80,7 +101,7 @@ t_event_callback
 
 static inline void event_callback (struct em_event* e)
 {
-	const unsigned long signature = e->signature;
+	const uintptr_t signature = e->signature;
 	int event = e->event;
 	const char *data_str = e->data_str;
 	const unsigned long data_num = e->data_num;
@@ -88,20 +109,20 @@ static inline void event_callback (struct em_event* e)
 	switch (event) {
 		case EM_CONNECTION_READ:
 		{
-			VALUE conn = rb_hash_aref (EmConnsHash, ULONG2NUM (signature));
+			VALUE conn = rb_hash_aref (EmConnsHash, BSIG2NUM (signature));
 			if (conn == Qnil)
-				rb_raise (EM_eConnectionNotBound, "received %lu bytes of data for unknown signature: %lu", data_num, signature);
+				rb_raise (EM_eConnectionNotBound, "received %lu bytes of data for unknown signature: %" PRIFBSIG, data_num, signature);
 			rb_funcall (conn, Intern_receive_data, 1, rb_str_new (data_str, data_num));
 			return;
 		}
 		case EM_CONNECTION_ACCEPTED:
 		{
-			rb_funcall (EmModule, Intern_event_callback, 3, ULONG2NUM(signature), INT2FIX(event), ULONG2NUM(data_num));
+			rb_funcall (EmModule, Intern_event_callback, 3, BSIG2NUM(signature), INT2FIX(event), ULONG2NUM(data_num));
 			return;
 		}
 		case EM_CONNECTION_UNBOUND:
 		{
-			rb_funcall (EmModule, Intern_event_callback, 3, ULONG2NUM(signature), INT2FIX(event), ULONG2NUM(data_num));
+			rb_funcall (EmModule, Intern_event_callback, 3, BSIG2NUM(signature), INT2FIX(event), ULONG2NUM(data_num));
 			return;
 		}
 		case EM_CONNECTION_COMPLETED:
@@ -174,7 +195,7 @@ static inline void event_callback (struct em_event* e)
 event_error_handler
 *******************/
 
-static void event_error_handler(VALUE unused, VALUE err)
+static void event_error_handler(VALUE self UNUSED, VALUE err)
 {
 	VALUE error_handler = rb_ivar_get(EmModule, Intern_at_error_handler);
 	rb_funcall (error_handler, Intern_call, 1, err);
@@ -184,7 +205,7 @@ static void event_error_handler(VALUE unused, VALUE err)
 event_callback_wrapper
 **********************/
 
-static void event_callback_wrapper (const unsigned long signature, int event, const char *data_str, const unsigned long data_num)
+static void event_callback_wrapper (const uintptr_t signature, int event, const char *data_str, const unsigned long data_num)
 {
 	struct em_event e;
 	e.signature = signature;
@@ -202,7 +223,7 @@ static void event_callback_wrapper (const unsigned long signature, int event, co
 t_initialize_event_machine
 **************************/
 
-static VALUE t_initialize_event_machine (VALUE self)
+static VALUE t_initialize_event_machine (VALUE self UNUSED)
 {
 	EmConnsHash = rb_ivar_get (EmModule, Intern_at_conns);
 	EmTimersHash = rb_ivar_get (EmModule, Intern_at_timers);
@@ -213,12 +234,21 @@ static VALUE t_initialize_event_machine (VALUE self)
 }
 
 
+/******************
+t_run_machine_once
+******************/
 
-/*****************************
-t_run_machine_without_threads
-*****************************/
+static VALUE t_run_machine_once (VALUE self UNUSED)
+{
+	return evma_run_machine_once () ? Qtrue : Qfalse;
+}
 
-static VALUE t_run_machine_without_threads (VALUE self)
+
+/*************
+t_run_machine
+*************/
+
+static VALUE t_run_machine (VALUE self UNUSED)
 {
 	evma_run_machine();
 	return Qnil;
@@ -229,12 +259,12 @@ static VALUE t_run_machine_without_threads (VALUE self)
 t_add_oneshot_timer
 *******************/
 
-static VALUE t_add_oneshot_timer (VALUE self, VALUE interval)
+static VALUE t_add_oneshot_timer (VALUE self UNUSED, VALUE interval)
 {
-	const unsigned long f = evma_install_oneshot_timer (FIX2INT (interval));
+	const uintptr_t f = evma_install_oneshot_timer (FIX2INT (interval));
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "ran out of timers; use #set_max_timers to increase limit");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 
@@ -242,21 +272,21 @@ static VALUE t_add_oneshot_timer (VALUE self, VALUE interval)
 t_start_server
 **************/
 
-static VALUE t_start_server (VALUE self, VALUE server, VALUE port)
+static VALUE t_start_server (VALUE self UNUSED, VALUE server, VALUE port)
 {
-	const unsigned long f = evma_create_tcp_server (StringValuePtr(server), FIX2INT(port));
+	const uintptr_t f = evma_create_tcp_server (StringValueCStr(server), FIX2INT(port));
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no acceptor (port is in use or requires root privileges)");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 /*************
 t_stop_server
 *************/
 
-static VALUE t_stop_server (VALUE self, VALUE signature)
+static VALUE t_stop_server (VALUE self UNUSED, VALUE signature)
 {
-	evma_stop_tcp_server (NUM2ULONG (signature));
+	evma_stop_tcp_server (NUM2BSIG (signature));
 	return Qnil;
 }
 
@@ -265,24 +295,24 @@ static VALUE t_stop_server (VALUE self, VALUE signature)
 t_start_unix_server
 *******************/
 
-static VALUE t_start_unix_server (VALUE self, VALUE filename)
+static VALUE t_start_unix_server (VALUE self UNUSED, VALUE filename)
 {
-	const unsigned long f = evma_create_unix_domain_server (StringValuePtr(filename));
+	const uintptr_t f = evma_create_unix_domain_server (StringValueCStr(filename));
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no unix-domain acceptor");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 /********************
 t_attach_sd
 ********************/
 
-static VALUE t_attach_sd(VALUE self, VALUE sd)
+static VALUE t_attach_sd(VALUE self UNUSED, VALUE sd)
 {
-	const unsigned long f = evma_attach_sd(FIX2INT(sd));
+	const uintptr_t f = evma_attach_sd(FIX2INT(sd));
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no socket descriptor acceptor");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 
@@ -290,9 +320,9 @@ static VALUE t_attach_sd(VALUE self, VALUE sd)
 t_send_data
 ***********/
 
-static VALUE t_send_data (VALUE self, VALUE signature, VALUE data, VALUE data_length)
+static VALUE t_send_data (VALUE self UNUSED, VALUE signature, VALUE data, VALUE data_length)
 {
-	int b = evma_send_data_to_connection (NUM2ULONG (signature), StringValuePtr (data), FIX2INT (data_length));
+	int b = evma_send_data_to_connection (NUM2BSIG (signature), StringValuePtr (data), FIX2INT (data_length));
 	return INT2NUM (b);
 }
 
@@ -301,9 +331,9 @@ static VALUE t_send_data (VALUE self, VALUE signature, VALUE data, VALUE data_le
 t_start_tls
 ***********/
 
-static VALUE t_start_tls (VALUE self, VALUE signature)
+static VALUE t_start_tls (VALUE self UNUSED, VALUE signature)
 {
-	evma_start_tls (NUM2ULONG (signature));
+	evma_start_tls (NUM2BSIG (signature));
 	return Qnil;
 }
 
@@ -311,14 +341,14 @@ static VALUE t_start_tls (VALUE self, VALUE signature)
 t_set_tls_parms
 ***************/
 
-static VALUE t_set_tls_parms (VALUE self, VALUE signature, VALUE privkeyfile, VALUE certchainfile, VALUE verify_peer)
+static VALUE t_set_tls_parms (VALUE self UNUSED, VALUE signature, VALUE privkeyfile, VALUE certchainfile, VALUE verify_peer, VALUE fail_if_no_peer_cert, VALUE snihostname, VALUE cipherlist, VALUE ecdh_curve, VALUE dhparam, VALUE ssl_version)
 {
 	/* set_tls_parms takes a series of positional arguments for specifying such things
 	 * as private keys and certificate chains.
 	 * It's expected that the parameter list will grow as we add more supported features.
 	 * ALL of these parameters are optional, and can be specified as empty or NULL strings.
 	 */
-	evma_set_tls_parms (NUM2ULONG (signature), StringValuePtr (privkeyfile), StringValuePtr (certchainfile), (verify_peer == Qtrue ? 1 : 0));
+	evma_set_tls_parms (NUM2BSIG (signature), StringValueCStr (privkeyfile), StringValueCStr (certchainfile), (verify_peer == Qtrue ? 1 : 0), (fail_if_no_peer_cert == Qtrue ? 1 : 0), StringValueCStr (snihostname), StringValueCStr (cipherlist), StringValueCStr (ecdh_curve), StringValueCStr (dhparam), NUM2INT (ssl_version));
 	return Qnil;
 }
 
@@ -326,16 +356,16 @@ static VALUE t_set_tls_parms (VALUE self, VALUE signature, VALUE privkeyfile, VA
 t_get_peer_cert
 ***************/
 
-static VALUE t_get_peer_cert (VALUE self, VALUE signature)
+#ifdef WITH_SSL
+static VALUE t_get_peer_cert (VALUE self UNUSED, VALUE signature)
 {
 	VALUE ret = Qnil;
 
-	#ifdef WITH_SSL
 	X509 *cert = NULL;
 	BUF_MEM *buf;
 	BIO *out;
 
-	cert = evma_get_peer_cert (NUM2ULONG (signature));
+	cert = evma_get_peer_cert (NUM2BSIG (signature));
 
 	if (cert != NULL) {
 		out = BIO_new(BIO_s_mem());
@@ -345,20 +375,104 @@ static VALUE t_get_peer_cert (VALUE self, VALUE signature)
 		X509_free(cert);
 		BIO_free(out);
 	}
-	#endif
 
 	return ret;
 }
+#else
+static VALUE t_get_peer_cert (VALUE self UNUSED, VALUE signature UNUSED)
+{
+	return Qnil;
+}
+#endif
+
+/***************
+t_get_cipher_bits
+***************/
+
+#ifdef WITH_SSL
+static VALUE t_get_cipher_bits (VALUE self UNUSED, VALUE signature)
+{
+	int bits = evma_get_cipher_bits (NUM2BSIG (signature));
+	if (bits == -1)
+		return Qnil;
+	return INT2NUM (bits);
+}
+#else
+static VALUE t_get_cipher_bits (VALUE self UNUSED, VALUE signature UNUSED)
+{
+	return Qnil;
+}
+#endif
+
+/***************
+t_get_cipher_name
+***************/
+
+#ifdef WITH_SSL
+static VALUE t_get_cipher_name (VALUE self UNUSED, VALUE signature)
+{
+	const char *protocol = evma_get_cipher_name (NUM2BSIG (signature));
+	if (protocol)
+		return rb_str_new2 (protocol);
+
+	return Qnil;
+}
+#else
+static VALUE t_get_cipher_name (VALUE self UNUSED, VALUE signature UNUSED)
+{
+	return Qnil;
+}
+#endif
+
+/***************
+t_get_cipher_protocol
+***************/
+
+#ifdef WITH_SSL
+static VALUE t_get_cipher_protocol (VALUE self UNUSED, VALUE signature)
+{
+	const char *cipher = evma_get_cipher_protocol (NUM2BSIG (signature));
+	if (cipher)
+		return rb_str_new2 (cipher);
+
+	return Qnil;
+}
+#else
+static VALUE t_get_cipher_protocol (VALUE self UNUSED, VALUE signature UNUSED)
+{
+	return Qnil;
+}
+#endif
+
+/***************
+t_get_sni_hostname
+***************/
+
+#ifdef WITH_SSL
+static VALUE t_get_sni_hostname (VALUE self UNUSED, VALUE signature)
+{
+	const char *sni_hostname = evma_get_sni_hostname (NUM2BSIG (signature));
+	if (sni_hostname)
+		return rb_str_new2 (sni_hostname);
+
+	return Qnil;
+}
+#else
+static VALUE t_get_sni_hostname (VALUE self UNUSED, VALUE signature UNUSED)
+{
+	return Qnil;
+}
+#endif
 
 /**************
 t_get_peername
 **************/
 
-static VALUE t_get_peername (VALUE self, VALUE signature)
+static VALUE t_get_peername (VALUE self UNUSED, VALUE signature)
 {
 	char buf[1024];
 	socklen_t len = sizeof buf;
-	if (evma_get_peername (NUM2ULONG (signature), (struct sockaddr*)buf, &len)) {
+	if (evma_get_peername (NUM2BSIG (signature), (struct sockaddr*)buf, &len)) {
 		return rb_str_new (buf, len);
 	}
 
@@ -369,11 +483,11 @@ static VALUE t_get_peername (VALUE self, VALUE signature)
 t_get_sockname
 **************/
 
-static VALUE t_get_sockname (VALUE self, VALUE signature)
+static VALUE t_get_sockname (VALUE self UNUSED, VALUE signature)
 {
 	char buf[1024];
 	socklen_t len = sizeof buf;
-	if (evma_get_sockname (NUM2ULONG (signature), (struct sockaddr*)buf, &len)) {
+	if (evma_get_sockname (NUM2BSIG (signature), (struct sockaddr*)buf, &len)) {
 		return rb_str_new (buf, len);
 	}
 
@@ -384,10 +498,10 @@ static VALUE t_get_sockname (VALUE self, VALUE signature)
 t_get_subprocess_pid
 ********************/
 
-static VALUE t_get_subprocess_pid (VALUE self, VALUE signature)
+static VALUE t_get_subprocess_pid (VALUE self UNUSED, VALUE signature)
 {
 	pid_t pid;
-	if (evma_get_subprocess_pid (NUM2ULONG (signature), &pid)) {
+	if (evma_get_subprocess_pid (NUM2BSIG (signature), &pid)) {
 		return INT2NUM (pid);
 	}
 
@@ -398,18 +512,32 @@ static VALUE t_get_subprocess_pid (VALUE self, VALUE signature)
 t_get_subprocess_status
 ***********************/
 
-static VALUE t_get_subprocess_status (VALUE self, VALUE signature)
+static VALUE t_get_subprocess_status (VALUE self UNUSED, VALUE signature)
 {
 	VALUE proc_status = Qnil;
 
 	int status;
 	pid_t pid;
 
-	if (evma_get_subprocess_status (NUM2ULONG (signature), &status)) {
-		if (evma_get_subprocess_pid (NUM2ULONG (signature), &pid)) {
+	if (evma_get_subprocess_status (NUM2BSIG (signature), &status)) {
+		if (evma_get_subprocess_pid (NUM2BSIG (signature), &pid)) {
 			proc_status = rb_obj_alloc(rb_cProcStatus);
+
+			/* MRI Ruby uses hidden instance vars */
 			rb_iv_set(proc_status, "status", INT2FIX(status));
 			rb_iv_set(proc_status, "pid", INT2FIX(pid));
+
+#ifdef RUBINIUS
+			/* Rubinius uses standard instance vars */
+			rb_iv_set(proc_status, "@pid", INT2FIX(pid));
+			if (WIFEXITED(status)) {
+				rb_iv_set(proc_status, "@status", INT2FIX(WEXITSTATUS(status)));
+			} else if (WIFSIGNALED(status)) {
+				rb_iv_set(proc_status, "@termsig", INT2FIX(WTERMSIG(status)));
+			} else if (WIFSTOPPED(status)){
+				rb_iv_set(proc_status, "@stopsig", INT2FIX(WSTOPSIG(status)));
+			}
+#endif
 		}
 	}
 
@@ -420,7 +548,7 @@ static VALUE t_get_subprocess_status (VALUE self, VALUE signature)
 t_get_connection_count
 **********************/
 
-static VALUE t_get_connection_count (VALUE self)
+static VALUE t_get_connection_count (VALUE self UNUSED)
 {
 	return INT2NUM(evma_get_connection_count());
 }
@@ -429,19 +557,19 @@ static VALUE t_get_connection_count (VALUE self)
 t_get_comm_inactivity_timeout
 *****************************/
 
-static VALUE t_get_comm_inactivity_timeout (VALUE self, VALUE signature)
+static VALUE t_get_comm_inactivity_timeout (VALUE self UNUSED, VALUE signature)
 {
-	return rb_float_new(evma_get_comm_inactivity_timeout(NUM2ULONG (signature)));
+	return rb_float_new(evma_get_comm_inactivity_timeout(NUM2BSIG (signature)));
 }
 
 /*****************************
 t_set_comm_inactivity_timeout
 *****************************/
 
-static VALUE t_set_comm_inactivity_timeout (VALUE self, VALUE signature, VALUE timeout)
+static VALUE t_set_comm_inactivity_timeout (VALUE self UNUSED, VALUE signature, VALUE timeout)
 {
 	float ti = RFLOAT_VALUE(timeout);
-	if (evma_set_comm_inactivity_timeout(NUM2ULONG(signature), ti)) {
+	if (evma_set_comm_inactivity_timeout(NUM2BSIG(signature), ti)) {
 		return Qtrue;
 	}
 	return Qfalse;
@@ -451,19 +579,19 @@ static VALUE t_set_comm_inactivity_timeout (VALUE self, VALUE signature, VALUE t
 t_get_pending_connect_timeout
 *****************************/
 
-static VALUE t_get_pending_connect_timeout (VALUE self, VALUE signature)
+static VALUE t_get_pending_connect_timeout (VALUE self UNUSED, VALUE signature)
 {
-	return rb_float_new(evma_get_pending_connect_timeout(NUM2ULONG (signature)));
+	return rb_float_new(evma_get_pending_connect_timeout(NUM2BSIG (signature)));
 }
 
 /*****************************
 t_set_pending_connect_timeout
 *****************************/
 
-static VALUE t_set_pending_connect_timeout (VALUE self, VALUE signature, VALUE timeout)
+static VALUE t_set_pending_connect_timeout (VALUE self UNUSED, VALUE signature, VALUE timeout)
 {
 	float ti = RFLOAT_VALUE(timeout);
-	if (evma_set_pending_connect_timeout(NUM2ULONG(signature), ti)) {
+	if (evma_set_pending_connect_timeout(NUM2BSIG(signature), ti)) {
 		return Qtrue;
 	}
 	return Qfalse;
@@ -473,9 +601,11 @@ static VALUE t_set_pending_connect_timeout (VALUE self, VALUE signature, VALUE t
 t_send_datagram
 ***************/
 
-static VALUE t_send_datagram (VALUE self, VALUE signature, VALUE data, VALUE data_length, VALUE address, VALUE port)
+static VALUE t_send_datagram (VALUE self UNUSED, VALUE signature, VALUE data, VALUE data_length, VALUE address, VALUE port)
 {
-	int b = evma_send_datagram (NUM2ULONG (signature), StringValuePtr (data), FIX2INT (data_length), StringValuePtr(address), FIX2INT(port));
+	int b = evma_send_datagram (NUM2BSIG (signature), StringValuePtr (data), FIX2INT (data_length), StringValueCStr(address), FIX2INT(port));
+	if (b < 0)
+		rb_raise (EM_eConnectionError, "%s", "error in sending datagram"); // FIXME: this could be more specific.
 	return INT2NUM (b);
 }
 
@@ -484,9 +614,9 @@ static VALUE t_send_datagram (VALUE self, VALUE signature, VALUE data, VALUE dat
 t_close_connection
 ******************/
 
-static VALUE t_close_connection (VALUE self, VALUE signature, VALUE after_writing)
+static VALUE t_close_connection (VALUE self UNUSED, VALUE signature, VALUE after_writing)
 {
-	evma_close_connection (NUM2ULONG (signature), ((after_writing == Qtrue) ? 1 : 0));
+	evma_close_connection (NUM2BSIG (signature), ((after_writing == Qtrue) ? 1 : 0));
 	return Qnil;
 }
 
@@ -494,9 +624,9 @@ static VALUE t_close_connection (VALUE self, VALUE signature, VALUE after_writin
 t_report_connection_error_status
 ********************************/
 
-static VALUE t_report_connection_error_status (VALUE self, VALUE signature)
+static VALUE t_report_connection_error_status (VALUE self UNUSED, VALUE signature)
 {
-	int b = evma_report_connection_error_status (NUM2ULONG (signature));
+	int b = evma_report_connection_error_status (NUM2BSIG (signature));
 	return INT2NUM (b);
 }
 
@@ -506,17 +636,17 @@ static VALUE t_report_connection_error_status (VALUE self, VALUE signature)
 t_connect_server
 ****************/
 
-static VALUE t_connect_server (VALUE self, VALUE server, VALUE port)
+static VALUE t_connect_server (VALUE self UNUSED, VALUE server, VALUE port)
 {
 	// Avoid FIX2INT in this case, because it doesn't deal with type errors properly.
 	// Specifically, if the value of port comes in as a string rather than an integer,
 	// NUM2INT will throw a type error, but FIX2INT will generate garbage.
 
 	try {
-		const unsigned long f = evma_connect_to_server (NULL, 0, StringValuePtr(server), NUM2INT(port));
+		const uintptr_t f = evma_connect_to_server (NULL, 0, StringValueCStr(server), NUM2INT(port));
 		if (!f)
 			rb_raise (EM_eConnectionError, "%s", "no connection");
-		return ULONG2NUM (f);
+		return BSIG2NUM (f);
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eConnectionError, "%s", e.what());
 	}
@@ -527,17 +657,17 @@ static VALUE t_connect_server (VALUE self, VALUE server, VALUE port)
 t_bind_connect_server
 *********************/
 
-static VALUE t_bind_connect_server (VALUE self, VALUE bind_addr, VALUE bind_port, VALUE server, VALUE port)
+static VALUE t_bind_connect_server (VALUE self UNUSED, VALUE bind_addr, VALUE bind_port, VALUE server, VALUE port)
 {
 	// Avoid FIX2INT in this case, because it doesn't deal with type errors properly.
 	// Specifically, if the value of port comes in as a string rather than an integer,
 	// NUM2INT will throw a type error, but FIX2INT will generate garbage.
 
 	try {
-		const unsigned long f = evma_connect_to_server (StringValuePtr(bind_addr), NUM2INT(bind_port), StringValuePtr(server), NUM2INT(port));
+		const uintptr_t f = evma_connect_to_server (StringValueCStr(bind_addr), NUM2INT(bind_port), StringValueCStr(server), NUM2INT(port));
 		if (!f)
 			rb_raise (EM_eConnectionError, "%s", "no connection");
-		return ULONG2NUM (f);
+		return BSIG2NUM (f);
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eConnectionError, "%s", e.what());
 	}
@@ -548,50 +678,50 @@ static VALUE t_bind_connect_server (VALUE self, VALUE bind_addr, VALUE bind_port
 t_connect_unix_server
 *********************/
 
-static VALUE t_connect_unix_server (VALUE self, VALUE serversocket)
+static VALUE t_connect_unix_server (VALUE self UNUSED, VALUE serversocket)
 {
-	const unsigned long f = evma_connect_to_unix_server (StringValuePtr(serversocket));
+	const uintptr_t f = evma_connect_to_unix_server (StringValueCStr(serversocket));
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no connection");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 /***********
 t_attach_fd
 ***********/
 
-static VALUE t_attach_fd (VALUE self, VALUE file_descriptor, VALUE watch_mode)
+static VALUE t_attach_fd (VALUE self UNUSED, VALUE file_descriptor, VALUE watch_mode)
 {
-	const unsigned long f = evma_attach_fd (NUM2INT(file_descriptor), watch_mode == Qtrue);
+	const uintptr_t f = evma_attach_fd (NUM2INT(file_descriptor), watch_mode == Qtrue);
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no connection");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 /***********
 t_detach_fd
 ***********/
 
-static VALUE t_detach_fd (VALUE self, VALUE signature)
+static VALUE t_detach_fd (VALUE self UNUSED, VALUE signature)
 {
-	return INT2NUM(evma_detach_fd (NUM2ULONG (signature)));
+	return INT2NUM(evma_detach_fd (NUM2BSIG (signature)));
 }
 
 /*********************
 t_get_file_descriptor
 *********************/
-static VALUE t_get_file_descriptor (VALUE self, VALUE signature)
+static VALUE t_get_file_descriptor (VALUE self UNUSED, VALUE signature)
 {
-	return INT2NUM(evma_get_file_descriptor (NUM2ULONG (signature)));
+	return INT2NUM(evma_get_file_descriptor (NUM2BSIG (signature)));
 }
 
 /**************
 t_get_sock_opt
 **************/
 
-static VALUE t_get_sock_opt (VALUE self, VALUE signature, VALUE lev, VALUE optname)
+static VALUE t_get_sock_opt (VALUE self UNUSED, VALUE signature, VALUE lev, VALUE optname)
 {
-	int fd = evma_get_file_descriptor (NUM2ULONG (signature));
+	int fd = evma_get_file_descriptor (NUM2BSIG (signature));
 	int level = NUM2INT(lev), option = NUM2INT(optname);
 	socklen_t len = 128;
 	char buf[128];
@@ -606,12 +736,12 @@ static VALUE t_get_sock_opt (VALUE self, VALUE signature, VALUE lev, VALUE optna
 t_set_sock_opt
 **************/
 
-static VALUE t_set_sock_opt (VALUE self, VALUE signature, VALUE lev, VALUE optname, VALUE optval)
+static VALUE t_set_sock_opt (VALUE self UNUSED, VALUE signature, VALUE lev, VALUE optname, VALUE optval)
 {
-	int fd = evma_get_file_descriptor (NUM2ULONG (signature));
+	int fd = evma_get_file_descriptor (NUM2BSIG (signature));
 	int level = NUM2INT(lev), option = NUM2INT(optname);
 	int i;
-	void *v;
+	const void *v;
 	socklen_t len;
 
 	switch (TYPE(optval)) {
@@ -644,18 +774,18 @@ static VALUE t_set_sock_opt (VALUE self, VALUE signature, VALUE lev, VALUE optna
 t_is_notify_readable
 ********************/
 
-static VALUE t_is_notify_readable (VALUE self, VALUE signature)
+static VALUE t_is_notify_readable (VALUE self UNUSED, VALUE signature)
 {
-	return evma_is_notify_readable(NUM2ULONG (signature)) ? Qtrue : Qfalse;
+	return evma_is_notify_readable(NUM2BSIG (signature)) ? Qtrue : Qfalse;
 }
 
 /*********************
 t_set_notify_readable
 *********************/
 
-static VALUE t_set_notify_readable (VALUE self, VALUE signature, VALUE mode)
+static VALUE t_set_notify_readable (VALUE self UNUSED, VALUE signature, VALUE mode)
 {
-	evma_set_notify_readable(NUM2ULONG (signature), mode == Qtrue);
+	evma_set_notify_readable(NUM2BSIG(signature), mode == Qtrue);
 	return Qnil;
 }
 
@@ -663,18 +793,18 @@ static VALUE t_set_notify_readable (VALUE self, VALUE signature, VALUE mode)
 t_is_notify_readable
 ********************/
 
-static VALUE t_is_notify_writable (VALUE self, VALUE signature)
+static VALUE t_is_notify_writable (VALUE self UNUSED, VALUE signature)
 {
-	return evma_is_notify_writable(NUM2ULONG (signature)) ? Qtrue : Qfalse;
+	return evma_is_notify_writable(NUM2BSIG (signature)) ? Qtrue : Qfalse;
 }
 
 /*********************
 t_set_notify_writable
 *********************/
 
-static VALUE t_set_notify_writable (VALUE self, VALUE signature, VALUE mode)
+static VALUE t_set_notify_writable (VALUE self UNUSED, VALUE signature, VALUE mode)
 {
-	evma_set_notify_writable(NUM2ULONG (signature), mode == Qtrue);
+	evma_set_notify_writable(NUM2BSIG (signature), mode == Qtrue);
 	return Qnil;
 }
 
@@ -682,34 +812,34 @@ static VALUE t_set_notify_writable (VALUE self, VALUE signature, VALUE mode)
 t_pause
 *******/
 
-static VALUE t_pause (VALUE self, VALUE signature)
+static VALUE t_pause (VALUE self UNUSED, VALUE signature)
 {
-	return evma_pause(NUM2ULONG (signature)) ? Qtrue : Qfalse;
+	return evma_pause(NUM2BSIG (signature)) ? Qtrue : Qfalse;
 }
 
 /********
 t_resume
 ********/
 
-static VALUE t_resume (VALUE self, VALUE signature)
+static VALUE t_resume (VALUE self UNUSED, VALUE signature)
 {
-	return evma_resume(NUM2ULONG (signature)) ? Qtrue : Qfalse;
+	return evma_resume(NUM2BSIG (signature)) ? Qtrue : Qfalse;
 }
 
 /**********
 t_paused_p
 **********/
 
-static VALUE t_paused_p (VALUE self, VALUE signature)
+static VALUE t_paused_p (VALUE self UNUSED, VALUE signature)
 {
-	return evma_is_paused(NUM2ULONG (signature)) ? Qtrue : Qfalse;
+	return evma_is_paused(NUM2BSIG (signature)) ? Qtrue : Qfalse;
 }
 
 /*********************
 t_num_close_scheduled
 *********************/
 
-static VALUE t_num_close_scheduled (VALUE self)
+static VALUE t_num_close_scheduled (VALUE self UNUSED)
 {
 	return INT2FIX(evma_num_close_scheduled());
 }
@@ -718,12 +848,12 @@ static VALUE t_num_close_scheduled (VALUE self)
 t_open_udp_socket
 *****************/
 
-static VALUE t_open_udp_socket (VALUE self, VALUE server, VALUE port)
+static VALUE t_open_udp_socket (VALUE self UNUSED, VALUE server, VALUE port)
 {
-	const unsigned long f = evma_open_datagram_socket (StringValuePtr(server), FIX2INT(port));
+	const uintptr_t f = evma_open_datagram_socket (StringValueCStr(server), FIX2INT(port));
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no datagram socket");
-	return ULONG2NUM (f);
+	return BSIG2NUM(f);
 }
 
 
@@ -732,7 +862,7 @@ static VALUE t_open_udp_socket (VALUE self, VALUE server, VALUE port)
 t_release_machine
 *****************/
 
-static VALUE t_release_machine (VALUE self)
+static VALUE t_release_machine (VALUE self UNUSED)
 {
 	evma_release_library();
 	return Qnil;
@@ -743,7 +873,7 @@ static VALUE t_release_machine (VALUE self)
 t_stop
 ******/
 
-static VALUE t_stop (VALUE self)
+static VALUE t_stop (VALUE self UNUSED)
 {
 	evma_stop_machine();
 	return Qnil;
@@ -753,7 +883,7 @@ static VALUE t_stop (VALUE self)
 t_signal_loopbreak
 ******************/
 
-static VALUE t_signal_loopbreak (VALUE self)
+static VALUE t_signal_loopbreak (VALUE self UNUSED)
 {
 	evma_signal_loopbreak();
 	return Qnil;
@@ -763,7 +893,7 @@ static VALUE t_signal_loopbreak (VALUE self)
 t_library_type
 **************/
 
-static VALUE t_library_type (VALUE self)
+static VALUE t_library_type (VALUE self UNUSED)
 {
 	return rb_eval_string (":extension");
 }
@@ -774,39 +904,54 @@ static VALUE t_library_type (VALUE self)
 t_set_timer_quantum
 *******************/
 
-static VALUE t_set_timer_quantum (VALUE self, VALUE interval)
+static VALUE t_set_timer_quantum (VALUE self UNUSED, VALUE interval)
 {
-  evma_set_timer_quantum (FIX2INT (interval));
-  return Qnil;
+	evma_set_timer_quantum (FIX2INT (interval));
+	return Qnil;
 }
 
 /********************
 t_get_max_timer_count
 ********************/
 
-static VALUE t_get_max_timer_count (VALUE self)
+static VALUE t_get_max_timer_count (VALUE self UNUSED)
 {
-  return INT2FIX (evma_get_max_timer_count());
+	return INT2FIX (evma_get_max_timer_count());
 }
 
 /********************
 t_set_max_timer_count
 ********************/
 
-static VALUE t_set_max_timer_count (VALUE self, VALUE ct)
+static VALUE t_set_max_timer_count (VALUE self UNUSED, VALUE ct)
 {
-  evma_set_max_timer_count (FIX2INT (ct));
-  return Qnil;
+	evma_set_max_timer_count (FIX2INT (ct));
+	return Qnil;
+}
+
+/********************
+t_get/set_simultaneous_accept_count
+********************/
+
+static VALUE t_get_simultaneous_accept_count (VALUE self UNUSED)
+{
+	return INT2FIX (evma_get_simultaneous_accept_count());
+}
+
+static VALUE t_set_simultaneous_accept_count (VALUE self UNUSED, VALUE ct)
+{
+	evma_set_simultaneous_accept_count (FIX2INT (ct));
+	return Qnil;
 }
 
 /***************
 t_setuid_string
 ***************/
 
-static VALUE t_setuid_string (VALUE self, VALUE username)
+static VALUE t_setuid_string (VALUE self UNUSED, VALUE username)
 {
-  evma_setuid_string (StringValuePtr (username));
-  return Qnil;
+	evma_setuid_string (StringValueCStr (username));
+	return Qnil;
 }
 
 
@@ -815,25 +960,29 @@ static VALUE t_setuid_string (VALUE self, VALUE username)
 t_invoke_popen
 **************/
 
-static VALUE t_invoke_popen (VALUE self, VALUE cmd)
+static VALUE t_invoke_popen (VALUE self UNUSED, VALUE cmd)
 {
-	// 1.8.7+
-	#ifdef RARRAY_LEN
-		int len = RARRAY_LEN(cmd);
-	#else
-		int len = RARRAY (cmd)->len;
+	#ifdef OS_WIN32
+	rb_raise (EM_eUnsupported, "popen is not available on this platform");
 	#endif
+
+	int len = RARRAY_LEN(cmd);
 	if (len >= 2048)
 		rb_raise (rb_eRuntimeError, "%s", "too many arguments to popen");
 	char *strings [2048];
 	for (int i=0; i < len; i++) {
 		VALUE ix = INT2FIX (i);
 		VALUE s = rb_ary_aref (1, &ix, cmd);
-		strings[i] = StringValuePtr (s);
+		strings[i] = StringValueCStr (s);
 	}
 	strings[len] = NULL;
 
-	const unsigned long f = evma_popen (strings);
+	uintptr_t f = 0;
+	try {
+		f = evma_popen (strings);
+	} catch (std::runtime_error e) {
+		rb_raise (rb_eRuntimeError, "%s", e.what());
+	}
 	if (!f) {
 		char *err = strerror (errno);
 		char buf[100];
@@ -841,7 +990,7 @@ static VALUE t_invoke_popen (VALUE self, VALUE cmd)
 		snprintf (buf, sizeof(buf)-1, "no popen: %s", (err?err:"???"));
 		rb_raise (rb_eRuntimeError, "%s", buf);
 	}
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 
@@ -849,12 +998,12 @@ static VALUE t_invoke_popen (VALUE self, VALUE cmd)
 t_read_keyboard
 ***************/
 
-static VALUE t_read_keyboard (VALUE self)
+static VALUE t_read_keyboard (VALUE self UNUSED)
 {
-	const unsigned long f = evma_open_keyboard();
+	const uintptr_t f = evma_open_keyboard();
 	if (!f)
 		rb_raise (rb_eRuntimeError, "%s", "no keyboard reader");
-	return ULONG2NUM (f);
+	return BSIG2NUM (f);
 }
 
 
@@ -862,10 +1011,10 @@ static VALUE t_read_keyboard (VALUE self)
 t_watch_filename
 ****************/
 
-static VALUE t_watch_filename (VALUE self, VALUE fname)
+static VALUE t_watch_filename (VALUE self UNUSED, VALUE fname)
 {
 	try {
-		return ULONG2NUM(evma_watch_filename(StringValuePtr(fname)));
+		return BSIG2NUM(evma_watch_filename(StringValueCStr(fname)));
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eUnsupported, "%s", e.what());
 	}
@@ -877,9 +1026,9 @@ static VALUE t_watch_filename (VALUE self, VALUE fname)
 t_unwatch_filename
 ******************/
 
-static VALUE t_unwatch_filename (VALUE self, VALUE sig)
+static VALUE t_unwatch_filename (VALUE self UNUSED, VALUE sig)
 {
-	evma_unwatch_filename(NUM2ULONG (sig));
+	evma_unwatch_filename(NUM2BSIG (sig));
 	return Qnil;
 }
 
@@ -888,10 +1037,10 @@ static VALUE t_unwatch_filename (VALUE self, VALUE sig)
 t_watch_pid
 ***********/
 
-static VALUE t_watch_pid (VALUE self, VALUE pid)
+static VALUE t_watch_pid (VALUE self UNUSED, VALUE pid)
 {
 	try {
-		return ULONG2NUM(evma_watch_pid(NUM2INT(pid)));
+		return BSIG2NUM(evma_watch_pid(NUM2INT(pid)));
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eUnsupported, "%s", e.what());
 	}
@@ -903,9 +1052,9 @@ static VALUE t_watch_pid (VALUE self, VALUE pid)
 t_unwatch_pid
 *************/
 
-static VALUE t_unwatch_pid (VALUE self, VALUE sig)
+static VALUE t_unwatch_pid (VALUE self UNUSED, VALUE sig)
 {
-	evma_unwatch_pid(NUM2ULONG (sig));
+	evma_unwatch_pid(NUM2BSIG (sig));
 	return Qnil;
 }
 
@@ -914,21 +1063,24 @@ static VALUE t_unwatch_pid (VALUE self, VALUE sig)
 t__epoll_p
 **********/
 
-static VALUE t__epoll_p (VALUE self)
+static VALUE t__epoll_p (VALUE self UNUSED)
 {
-  #ifdef HAVE_EPOLL
-  return Qtrue;
-  #else
-  return Qfalse;
-  #endif
+	#ifdef HAVE_EPOLL
+	return Qtrue;
+	#else
+	return Qfalse;
+	#endif
 }
 
 /********
 t__epoll
 ********/
 
-static VALUE t__epoll (VALUE self)
+static VALUE t__epoll (VALUE self UNUSED)
 {
+	if (t__epoll_p(self) == Qfalse)
+		return Qfalse;
+
 	evma_set_epoll (1);
 	return Qtrue;
 }
@@ -939,7 +1091,7 @@ t__epoll_set
 
 static VALUE t__epoll_set (VALUE self, VALUE val)
 {
-	if (t__epoll_p(self) == Qfalse)
+	if (t__epoll_p(self) == Qfalse && val == Qtrue)
 		rb_raise (EM_eUnsupported, "%s", "epoll is not supported on this platform");
 
 	evma_set_epoll (val == Qtrue ? 1 : 0);
@@ -951,21 +1103,24 @@ static VALUE t__epoll_set (VALUE self, VALUE val)
 t__kqueue_p
 ***********/
 
-static VALUE t__kqueue_p (VALUE self)
+static VALUE t__kqueue_p (VALUE self UNUSED)
 {
-  #ifdef HAVE_KQUEUE
-  return Qtrue;
-  #else
-  return Qfalse;
-  #endif
+	#ifdef HAVE_KQUEUE
+	return Qtrue;
+	#else
+	return Qfalse;
+	#endif
 }
 
 /*********
 t__kqueue
 *********/
 
-static VALUE t__kqueue (VALUE self)
+static VALUE t__kqueue (VALUE self UNUSED)
 {
+	if (t__kqueue_p(self) == Qfalse)
+		return Qfalse;
+
 	evma_set_kqueue (1);
 	return Qtrue;
 }
@@ -976,7 +1131,7 @@ t__kqueue_set
 
 static VALUE t__kqueue_set (VALUE self, VALUE val)
 {
-	if (t__kqueue_p(self) == Qfalse)
+	if (t__kqueue_p(self) == Qfalse && val == Qtrue)
 		rb_raise (EM_eUnsupported, "%s", "kqueue is not supported on this platform");
 
 	evma_set_kqueue (val == Qtrue ? 1 : 0);
@@ -988,13 +1143,30 @@ static VALUE t__kqueue_set (VALUE self, VALUE val)
 t__ssl_p
 ********/
 
-static VALUE t__ssl_p (VALUE self)
+static VALUE t__ssl_p (VALUE self UNUSED)
 {
-  #ifdef WITH_SSL
-  return Qtrue;
-  #else
-  return Qfalse;
-  #endif
+	#ifdef WITH_SSL
+	return Qtrue;
+	#else
+	return Qfalse;
+	#endif
+}
+
+/********
+t_stopping
+********/
+
+static VALUE t_stopping ()
+{
+    if (evma_stopping())
+    {
+        return Qtrue;
+    }
+    else
+    {
+        return Qfalse;
+    }
+
 }
 
 
@@ -1002,7 +1174,7 @@ static VALUE t__ssl_p (VALUE self)
 t_send_file_data
 ****************/
 
-static VALUE t_send_file_data (VALUE self, VALUE signature, VALUE filename)
+static VALUE t_send_file_data (VALUE self UNUSED, VALUE signature, VALUE filename)
 {
 
 	/* The current implementation of evma_send_file_data_to_connection enforces a strict
@@ -1013,14 +1185,14 @@ static VALUE t_send_file_data (VALUE self, VALUE signature, VALUE filename)
 	 * do this. For one thing it's ugly. For another, we can't be sure zero is never a real errno.
 	 */
 
-	int b = evma_send_file_data_to_connection (NUM2ULONG (signature), StringValuePtr(filename));
+	int b = evma_send_file_data_to_connection (NUM2BSIG (signature), StringValueCStr(filename));
 	if (b == -1)
 		rb_raise(rb_eRuntimeError, "%s", "File too large.  send_file_data() supports files under 32k.");
 	if (b > 0) {
 		char *err = strerror (b);
 		char buf[1024];
 		memset (buf, 0, sizeof(buf));
-		snprintf (buf, sizeof(buf)-1, ": %s %s", StringValuePtr(filename),(err?err:"???"));
+		snprintf (buf, sizeof(buf)-1, ": %s %s", StringValueCStr(filename),(err?err:"???"));
 
 		rb_raise (rb_eIOError, "%s", buf);
 	}
@@ -1033,7 +1205,7 @@ static VALUE t_send_file_data (VALUE self, VALUE signature, VALUE filename)
 t_set_rlimit_nofile
 *******************/
 
-static VALUE t_set_rlimit_nofile (VALUE self, VALUE arg)
+static VALUE t_set_rlimit_nofile (VALUE self UNUSED, VALUE arg)
 {
 	arg = (NIL_P(arg)) ? -1 : NUM2INT (arg);
 	return INT2NUM (evma_set_rlimit_nofile (arg));
@@ -1046,7 +1218,7 @@ conn_get_outbound_data_size
 static VALUE conn_get_outbound_data_size (VALUE self)
 {
 	VALUE sig = rb_ivar_get (self, Intern_at_signature);
-	return INT2NUM (evma_get_outbound_data_size (NUM2ULONG (sig)));
+	return INT2NUM (evma_get_outbound_data_size (NUM2BSIG (sig)));
 }
 
 
@@ -1054,7 +1226,7 @@ static VALUE conn_get_outbound_data_size (VALUE self)
 conn_associate_callback_target
 ******************************/
 
-static VALUE conn_associate_callback_target (VALUE self, VALUE sig)
+static VALUE conn_associate_callback_target (VALUE self UNUSED, VALUE sig UNUSED)
 {
 	// No-op for the time being.
 	return Qnil;
@@ -1065,22 +1237,19 @@ static VALUE conn_associate_callback_target (VALUE self, VALUE sig)
 t_get_loop_time
 ****************/
 
-static VALUE t_get_loop_time (VALUE self)
+static VALUE t_get_loop_time (VALUE self UNUSED)
 {
-#ifndef HAVE_RB_TIME_NEW
-  static VALUE cTime = rb_path2class("Time");
-  static ID at = rb_intern("at");
-#endif
+	uint64_t current_time = evma_get_current_loop_time();
+	if (current_time == 0) {
+		return Qnil;
+	}
 
-  uint64_t current_time = evma_get_current_loop_time();
-  if (current_time != 0) {
-#ifndef HAVE_RB_TIME_NEW
-    return rb_funcall(cTime, at, 2, INT2NUM(current_time / 1000000), INT2NUM(current_time % 1000000));
-#else
-    return rb_time_new(current_time / 1000000, current_time % 1000000);
-#endif
-  }
-  return Qnil;
+	// Generally the industry has moved to 64-bit time_t, this is just in case we're 32-bit time_t.
+	if (sizeof(time_t) < 8 && current_time > INT_MAX) {
+		return rb_funcall(rb_cTime, Intern_at, 2, INT2NUM(current_time / 1000000), INT2NUM(current_time % 1000000));
+	} else {
+		return rb_time_new(current_time / 1000000, current_time % 1000000);
+	}
 }
 
 
@@ -1088,10 +1257,10 @@ static VALUE t_get_loop_time (VALUE self)
 t_start_proxy
 **************/
 
-static VALUE t_start_proxy (VALUE self, VALUE from, VALUE to, VALUE bufsize, VALUE length)
+static VALUE t_start_proxy (VALUE self UNUSED, VALUE from, VALUE to, VALUE bufsize, VALUE length)
 {
 	try {
-		evma_start_proxy(NUM2ULONG (from), NUM2ULONG (to), NUM2ULONG(bufsize), NUM2ULONG(length));
+		evma_start_proxy(NUM2BSIG (from), NUM2BSIG (to), NUM2ULONG(bufsize), NUM2ULONG(length));
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eConnectionError, "%s", e.what());
 	}
@@ -1103,10 +1272,10 @@ static VALUE t_start_proxy (VALUE self, VALUE from, VALUE to, VALUE bufsize, VAL
 t_stop_proxy
 *************/
 
-static VALUE t_stop_proxy (VALUE self, VALUE from)
+static VALUE t_stop_proxy (VALUE self UNUSED, VALUE from)
 {
 	try{
-		evma_stop_proxy(NUM2ULONG (from));
+		evma_stop_proxy(NUM2BSIG (from));
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eConnectionError, "%s", e.what());
 	}
@@ -1117,10 +1286,10 @@ static VALUE t_stop_proxy (VALUE self, VALUE from)
 t_proxied_bytes
 ****************/
 
-static VALUE t_proxied_bytes (VALUE self, VALUE from)
+static VALUE t_proxied_bytes (VALUE self UNUSED, VALUE from)
 {
 	try{
-		return ULONG2NUM(evma_proxied_bytes(NUM2ULONG (from)));
+		return BSIG2NUM(evma_proxied_bytes(NUM2BSIG (from)));
 	} catch (std::runtime_error e) {
 		rb_raise (EM_eConnectionError, "%s", e.what());
 	}
@@ -1131,14 +1300,14 @@ static VALUE t_proxied_bytes (VALUE self, VALUE from)
 t_get_idle_time
 ****************/
 
-static VALUE t_get_idle_time (VALUE self, VALUE from)
+static VALUE t_get_idle_time (VALUE self UNUSED, VALUE from)
 {
 	try{
 		uint64_t current_time = evma_get_current_loop_time();
-		uint64_t time = evma_get_last_activity_time(NUM2ULONG (from));
+		uint64_t time = evma_get_last_activity_time(NUM2BSIG (from));
 		if (current_time != 0 && time != 0) {
 			if (time >= current_time)
-				return ULONG2NUM(0);
+				return BSIG2NUM(0);
 			else {
 				uint64_t diff = current_time - time;
 				float seconds = diff / (1000.0*1000.0);
@@ -1156,7 +1325,7 @@ static VALUE t_get_idle_time (VALUE self, VALUE from)
 t_get_heartbeat_interval
 *************************/
 
-static VALUE t_get_heartbeat_interval (VALUE self)
+static VALUE t_get_heartbeat_interval (VALUE self UNUSED)
 {
 	return rb_float_new(evma_get_heartbeat_interval());
 }
@@ -1166,7 +1335,7 @@ static VALUE t_get_heartbeat_interval (VALUE self)
 t_set_heartbeat_interval
 *************************/
 
-static VALUE t_set_heartbeat_interval (VALUE self, VALUE interval)
+static VALUE t_set_heartbeat_interval (VALUE self UNUSED, VALUE interval)
 {
 	float iv = RFLOAT_VALUE(interval);
 	if (evma_set_heartbeat_interval(iv))
@@ -1195,6 +1364,7 @@ extern "C" void Init_rubyeventmachine()
 	Intern_run_deferred_callbacks = rb_intern ("run_deferred_callbacks");
 	Intern_delete = rb_intern ("delete");
 	Intern_call = rb_intern ("call");
+	Intern_at = rb_intern("at");
 	Intern_receive_data = rb_intern ("receive_data");
 	Intern_ssl_handshake_completed = rb_intern ("ssl_handshake_completed");
 	Intern_ssl_verify_peer = rb_intern ("ssl_verify_peer");
@@ -1217,16 +1387,21 @@ extern "C" void Init_rubyeventmachine()
 	EM_eUnsupported = rb_define_class_under (EmModule, "Unsupported", rb_eRuntimeError);
 
 	rb_define_module_function (EmModule, "initialize_event_machine", (VALUE(*)(...))t_initialize_event_machine, 0);
-	rb_define_module_function (EmModule, "run_machine", (VALUE(*)(...))t_run_machine_without_threads, 0);
-	rb_define_module_function (EmModule, "run_machine_without_threads", (VALUE(*)(...))t_run_machine_without_threads, 0);
+	rb_define_module_function (EmModule, "run_machine_once", (VALUE(*)(...))t_run_machine_once, 0);
+	rb_define_module_function (EmModule, "run_machine", (VALUE(*)(...))t_run_machine, 0);
+	rb_define_module_function (EmModule, "run_machine_without_threads", (VALUE(*)(...))t_run_machine, 0);
 	rb_define_module_function (EmModule, "add_oneshot_timer", (VALUE(*)(...))t_add_oneshot_timer, 1);
 	rb_define_module_function (EmModule, "start_tcp_server", (VALUE(*)(...))t_start_server, 2);
 	rb_define_module_function (EmModule, "stop_tcp_server", (VALUE(*)(...))t_stop_server, 1);
 	rb_define_module_function (EmModule, "start_unix_server", (VALUE(*)(...))t_start_unix_server, 1);
 	rb_define_module_function (EmModule, "attach_sd", (VALUE(*)(...))t_attach_sd, 1);
-	rb_define_module_function (EmModule, "set_tls_parms", (VALUE(*)(...))t_set_tls_parms, 4);
+	rb_define_module_function (EmModule, "set_tls_parms", (VALUE(*)(...))t_set_tls_parms, 10);
 	rb_define_module_function (EmModule, "start_tls", (VALUE(*)(...))t_start_tls, 1);
 	rb_define_module_function (EmModule, "get_peer_cert", (VALUE(*)(...))t_get_peer_cert, 1);
+	rb_define_module_function (EmModule, "get_cipher_bits", (VALUE(*)(...))t_get_cipher_bits, 1);
+	rb_define_module_function (EmModule, "get_cipher_name", (VALUE(*)(...))t_get_cipher_name, 1);
+	rb_define_module_function (EmModule, "get_cipher_protocol", (VALUE(*)(...))t_get_cipher_protocol, 1);
+	rb_define_module_function (EmModule, "get_sni_hostname", (VALUE(*)(...))t_get_sni_hostname, 1);
 	rb_define_module_function (EmModule, "send_data", (VALUE(*)(...))t_send_data, 3);
 	rb_define_module_function (EmModule, "send_datagram", (VALUE(*)(...))t_send_datagram, 5);
 	rb_define_module_function (EmModule, "close_connection", (VALUE(*)(...))t_close_connection, 2);
@@ -1271,6 +1446,8 @@ extern "C" void Init_rubyeventmachine()
 	rb_define_module_function (EmModule, "set_timer_quantum", (VALUE(*)(...))t_set_timer_quantum, 1);
 	rb_define_module_function (EmModule, "get_max_timer_count", (VALUE(*)(...))t_get_max_timer_count, 0);
 	rb_define_module_function (EmModule, "set_max_timer_count", (VALUE(*)(...))t_set_max_timer_count, 1);
+	rb_define_module_function (EmModule, "get_simultaneous_accept_count", (VALUE(*)(...))t_get_simultaneous_accept_count, 0);
+	rb_define_module_function (EmModule, "set_simultaneous_accept_count", (VALUE(*)(...))t_set_simultaneous_accept_count, 1);
 	rb_define_module_function (EmModule, "setuid_string", (VALUE(*)(...))t_setuid_string, 1);
 	rb_define_module_function (EmModule, "invoke_popen", (VALUE(*)(...))t_invoke_popen, 1);
 	rb_define_module_function (EmModule, "send_file_data", (VALUE(*)(...))t_send_file_data, 2);
@@ -1298,21 +1475,30 @@ extern "C" void Init_rubyeventmachine()
 	rb_define_module_function (EmModule, "kqueue?", (VALUE(*)(...))t__kqueue_p, 0);
 
 	rb_define_module_function (EmModule, "ssl?", (VALUE(*)(...))t__ssl_p, 0);
+	rb_define_module_function(EmModule, "stopping?",(VALUE(*)(...))t_stopping, 0);
 
 	rb_define_method (EmConnection, "get_outbound_data_size", (VALUE(*)(...))conn_get_outbound_data_size, 0);
 	rb_define_method (EmConnection, "associate_callback_target", (VALUE(*)(...))conn_associate_callback_target, 1);
 
-	rb_define_const (EmModule, "TimerFired", INT2NUM(100));
-	rb_define_const (EmModule, "ConnectionData", INT2NUM(101));
-	rb_define_const (EmModule, "ConnectionUnbound", INT2NUM(102));
-	rb_define_const (EmModule, "ConnectionAccepted", INT2NUM(103));
-	rb_define_const (EmModule, "ConnectionCompleted", INT2NUM(104));
-	rb_define_const (EmModule, "LoopbreakSignalled", INT2NUM(105));
+	// Connection states
+	rb_define_const (EmModule, "TimerFired",               INT2NUM(EM_TIMER_FIRED               ));
+	rb_define_const (EmModule, "ConnectionData",           INT2NUM(EM_CONNECTION_READ           ));
+	rb_define_const (EmModule, "ConnectionUnbound",        INT2NUM(EM_CONNECTION_UNBOUND        ));
+	rb_define_const (EmModule, "ConnectionAccepted",       INT2NUM(EM_CONNECTION_ACCEPTED       ));
+	rb_define_const (EmModule, "ConnectionCompleted",      INT2NUM(EM_CONNECTION_COMPLETED      ));
+	rb_define_const (EmModule, "LoopbreakSignalled",       INT2NUM(EM_LOOPBREAK_SIGNAL          ));
+	rb_define_const (EmModule, "ConnectionNotifyReadable", INT2NUM(EM_CONNECTION_NOTIFY_READABLE));
+	rb_define_const (EmModule, "ConnectionNotifyWritable", INT2NUM(EM_CONNECTION_NOTIFY_WRITABLE));
+	rb_define_const (EmModule, "SslHandshakeCompleted",    INT2NUM(EM_SSL_HANDSHAKE_COMPLETED   ));
+	// EM_SSL_VERIFY = 109,
+	// EM_PROXY_TARGET_UNBOUND = 110,
+	// EM_PROXY_COMPLETED = 111
 
-	rb_define_const (EmModule, "ConnectionNotifyReadable", INT2NUM(106));
-	rb_define_const (EmModule, "ConnectionNotifyWritable", INT2NUM(107));
-
-	rb_define_const (EmModule, "SslHandshakeCompleted", INT2NUM(108));
-
+	// SSL Protocols
+	rb_define_const (EmModule, "EM_PROTO_SSLv2",   INT2NUM(EM_PROTO_SSLv2  ));
+	rb_define_const (EmModule, "EM_PROTO_SSLv3",   INT2NUM(EM_PROTO_SSLv3  ));
+	rb_define_const (EmModule, "EM_PROTO_TLSv1",   INT2NUM(EM_PROTO_TLSv1  ));
+	rb_define_const (EmModule, "EM_PROTO_TLSv1_1", INT2NUM(EM_PROTO_TLSv1_1));
+	rb_define_const (EmModule, "EM_PROTO_TLSv1_2", INT2NUM(EM_PROTO_TLSv1_2));
 }
 

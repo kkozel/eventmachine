@@ -12,6 +12,9 @@ def add_define(name)
   $defs.push("-D#{name}")
 end
 
+# Eager check devs tools
+have_devel? if respond_to?(:have_devel?)
+
 add_define 'BUILD_FOR_RUBY'
 
 # Minor platform details between *nix and Windows:
@@ -53,13 +56,17 @@ when /solaris/
   add_define 'OS_SOLARIS8'
   check_libs(%w[nsl socket], true)
 
-  if CONFIG['CC'] == 'cc' and `cc -flags 2>&1` =~ /Sun/ # detect SUNWspro compiler
+  if CONFIG['CC'] == 'cc' && (
+     `cc -flags 2>&1` =~ /Sun/ || # detect SUNWspro compiler
+     `cc -V 2>&1` =~ /Sun/        # detect Solaris Studio compiler
+    )
     # SUN CHAIN
     add_define 'CC_SUNWspro'
     $preload = ["\nCXX = CC"] # hack a CXX= line into the makefile
     $CFLAGS = CONFIG['CFLAGS'] = "-KPIC"
     CONFIG['CCDLFLAGS'] = "-KPIC"
     CONFIG['LDSHARED'] = "$(CXX) -G -KPIC -lCstd"
+    CONFIG['LDSHAREDXX'] = "$(CXX) -G -KPIC -lCstd"
   else
     # GNU CHAIN
     # on Unix we need a g++ link, not gcc.
@@ -83,8 +90,7 @@ when /linux/
   CONFIG['LDSHARED'] = "$(CXX) -shared"
 
 when /aix/
-  # on Unix we need a g++ link, not gcc.
-  CONFIG['LDSHARED'] = "$(CXX) -shared -Wl,-G"
+  CONFIG['LDSHARED'] = "$(CXX) -Wl,-bstatic -Wl,-bdynamic -Wl,-G -Wl,-brtl"
 
 when /cygwin/
   # For rubies built with Cygwin, CXX may be set to CC, which is just

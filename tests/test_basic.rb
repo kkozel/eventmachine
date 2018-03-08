@@ -93,12 +93,25 @@ class TestBasic < Test::Unit::TestCase
     end
   end
 
-  def test_unbind_error
+  def test_unbind_error_during_stop
     assert_raises( UnbindError::ERR ) {
       EM.run {
         EM.start_server "127.0.0.1", @port
-        EM.connect "127.0.0.1", @port, UnbindError
+        EM.connect "127.0.0.1", @port, UnbindError do
+          EM.stop
+        end
       }
+    }
+  end
+
+  def test_unbind_error
+    EM.run {
+      EM.error_handler do |e|
+        assert(e.is_a?(UnbindError::ERR))
+        EM.stop
+      end
+      EM.start_server "127.0.0.1", @port
+      EM.connect "127.0.0.1", @port, UnbindError
     }
   end
 
@@ -131,6 +144,8 @@ class TestBasic < Test::Unit::TestCase
   end
 
   def test_bind_connect
+    pend('FIXME: this test is broken on Windows') if windows?
+
     local_ip = UDPSocket.open {|s| s.connect('google.com', 80); s.addr.last }
 
     bind_port = next_port
@@ -179,18 +194,15 @@ class TestBasic < Test::Unit::TestCase
     assert x
   end
 
-  if EM.respond_to? :set_heartbeat_interval
-    def test_set_heartbeat_interval
-      interval = 0.5
-      EM.run {
-        EM.set_heartbeat_interval interval
-        $interval = EM.get_heartbeat_interval
-        EM.stop
-      }
-      assert_equal(interval, $interval)
-    end
-  else
-    warn "EM.set_heartbeat_interval not implemented, skipping a test in #{__FILE__}"
+  def test_set_heartbeat_interval
+    omit_if(jruby?)
+    interval = 0.5
+    EM.run {
+      EM.set_heartbeat_interval interval
+      $interval = EM.get_heartbeat_interval
+      EM.stop
+    }
+    assert_equal(interval, $interval)
   end
   
   module PostInitRaiser
@@ -226,6 +238,7 @@ class TestBasic < Test::Unit::TestCase
   end
   
   def test_schedule_close
+    omit_if(jruby?)
     localhost, port = '127.0.0.1', 9000
     timer_ran = false
     num_close_scheduled = nil
@@ -244,30 +257,6 @@ class TestBasic < Test::Unit::TestCase
     end
     assert !timer_ran
     assert_equal 1, num_close_scheduled
-  end
-
-  def test_fork_safe
-    return unless cpid = fork { exit! } rescue false
-
-    read, write = IO.pipe
-    EM.run do
-      cpid = fork do
-        write.puts "forked"
-        EM.run do
-          EM.next_tick do
-            write.puts "EM ran"
-            exit!
-          end
-        end
-      end
-      EM.stop
-    end
-    Process.waitall
-    assert_equal "forked\n", read.readline
-    assert_equal "EM ran\n", read.readline
-  ensure
-    read.close rescue nil
-    write.close rescue nil
   end
 
   def test_error_handler_idempotent # issue 185

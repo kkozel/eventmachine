@@ -229,6 +229,11 @@ void PipeDescriptor::Write()
 
 	assert (GetSocket() != INVALID_SOCKET);
 	int bytes_written = write (GetSocket(), output_buffer, nbytes);
+#ifdef OS_WIN32
+	int e = WSAGetLastError();
+#else
+	int e = errno;
+#endif
 
 	if (bytes_written > 0) {
 		OutboundDataSize -= bytes_written;
@@ -242,17 +247,19 @@ void PipeDescriptor::Write()
 			OutboundPages.push_front (OutboundPage (buffer, len));
 		}
 		#ifdef HAVE_EPOLL
-		EpollEvent.events = (EPOLLIN | (SelectForWrite() ? EPOLLOUT : 0));
+		EpollEvent.events = EPOLLIN;
+		if (SelectForWrite())
+			EpollEvent.events |= EPOLLOUT;
 		assert (MyEventMachine);
 		MyEventMachine->Modify (this);
 		#endif
 	}
 	else {
 		#ifdef OS_UNIX
-		if ((errno != EINPROGRESS) && (errno != EWOULDBLOCK) && (errno != EINTR))
+		if ((e != EINPROGRESS) && (e != EWOULDBLOCK) && (e != EINTR))
 		#endif
 		#ifdef OS_WIN32
-		if ((errno != WSAEINPROGRESS) && (errno != WSAEWOULDBLOCK))
+		if ((e != WSAEINPROGRESS) && (e != WSAEWOULDBLOCK))
 		#endif
 			Close();
 	}
@@ -305,7 +312,7 @@ bool PipeDescriptor::SelectForWrite()
 PipeDescriptor::SendOutboundData
 ********************************/
 
-int PipeDescriptor::SendOutboundData (const char *data, int length)
+int PipeDescriptor::SendOutboundData (const char *data, unsigned long length)
 {
 	//if (bCloseNow || bCloseAfterWriting)
 	if (IsCloseScheduled())

@@ -31,7 +31,7 @@ bool SetSocketNonblocking (SOCKET sd)
 	int val = fcntl (sd, F_GETFL, 0);
 	return (fcntl (sd, F_SETFL, val | O_NONBLOCK) != SOCKET_ERROR) ? true : false;
 	#endif
-	
+
 	#ifdef OS_WIN32
 	#ifdef BUILD_FOR_RUBY
 	// 14Jun09 Ruby provides its own wrappers for ioctlsocket. On 1.8 this is a simple wrapper,
@@ -45,12 +45,30 @@ bool SetSocketNonblocking (SOCKET sd)
 	#endif
 }
 
+/************
+SetFdCloexec
+************/
+
+#ifdef OS_UNIX
+bool SetFdCloexec (int fd)
+{
+	int flags = fcntl(fd, F_GETFD, 0);
+	assert (flags >= 0);
+	flags |= FD_CLOEXEC;
+	return (fcntl(fd, F_SETFD, FD_CLOEXEC) == 0) ? true : false;
+}
+#else
+bool SetFdCloexec (int fd UNUSED)
+{
+	return true;
+}
+#endif
 
 /****************************************
 EventableDescriptor::EventableDescriptor
 ****************************************/
 
-EventableDescriptor::EventableDescriptor (int sd, EventMachine_t *em):
+EventableDescriptor::EventableDescriptor (SOCKET sd, EventMachine_t *em):
 	bCloseNow (false),
 	bCloseAfterWriting (false),
 	MySocket (sd),
@@ -217,8 +235,14 @@ EventableDescriptor::ScheduleClose
 
 void EventableDescriptor::ScheduleClose (bool after_writing)
 {
-	if (IsCloseScheduled())
+	if (IsCloseScheduled()) {
+		if (!after_writing) {
+			// If closing has become more urgent, then upgrade the scheduled
+			// after_writing close to one NOW.
+			bCloseNow = true;
+		}
 		return;
+	}
 	MyEventMachine->NumCloseScheduled++;
 	// KEEP THIS SYNCHRONIZED WITH ::IsCloseScheduled.
 	if (after_writing)
@@ -243,7 +267,7 @@ bool EventableDescriptor::IsCloseScheduled()
 EventableDescriptor::StartProxy
 *******************************/
 
-void EventableDescriptor::StartProxy(const unsigned long to, const unsigned long bufsize, const unsigned long length)
+void EventableDescriptor::StartProxy(const uintptr_t to, const unsigned long bufsize, const unsigned long length)
 {
 	EventableDescriptor *ed = dynamic_cast <EventableDescriptor*> (Bindable_t::GetObject (to));
 	if (ed) {
@@ -289,13 +313,13 @@ void EventableDescriptor::SetProxiedFrom(EventableDescriptor *from, const unsign
 EventableDescriptor::_GenericInboundDispatch
 ********************************************/
 
-void EventableDescriptor::_GenericInboundDispatch(const char *buf, int size)
+void EventableDescriptor::_GenericInboundDispatch(const char *buf, unsigned long size)
 {
 	assert(EventCallback);
 
 	if (ProxyTarget) {
 		if (BytesToProxy > 0) {
-			unsigned long proxied = min(BytesToProxy, (unsigned long) size);
+			unsigned long proxied = min(BytesToProxy, size);
 			ProxyTarget->SendOutboundData(buf, proxied);
 			ProxiedBytes += (unsigned long) proxied;
 			BytesToProxy -= proxied;
@@ -308,7 +332,7 @@ void EventableDescriptor::_GenericInboundDispatch(const char *buf, int size)
 			}
 		} else {
 			ProxyTarget->SendOutboundData(buf, size);
-			ProxiedBytes += (unsigned long) size;
+			ProxiedBytes += size;
 		}
 	} else {
 		(*EventCallback)(GetBinding(), EM_CONNECTION_READ, buf, size);
@@ -371,7 +395,7 @@ uint64_t EventableDescriptor::GetNextHeartbeat()
 ConnectionDescriptor::ConnectionDescriptor
 ******************************************/
 
-ConnectionDescriptor::ConnectionDescriptor (int sd, EventMachine_t *em):
+ConnectionDescriptor::ConnectionDescriptor (SOCKET sd, EventMachine_t *em):
 	EventableDescriptor (sd, em),
 	bConnectPending (false),
 	bNotifyReadable (false),
@@ -426,6 +450,9 @@ void ConnectionDescriptor::_UpdateEvents(bool read, bool write)
 	if (MySocket == INVALID_SOCKET)
 		return;
 
+	if (!read && !write)
+		return;
+
 	#ifdef HAVE_EPOLL
 	unsigned int old = EpollEvent.events;
 
@@ -450,8 +477,9 @@ void ConnectionDescriptor::_UpdateEvents(bool read, bool write)
 	#ifdef HAVE_KQUEUE
 	if (read && SelectForRead())
 		MyEventMachine->ArmKqueueReader (this);
-	if (write && SelectForWrite())
-		MyEventMachine->ArmKqueueWriter (this);
+	bKqueueArmWrite = SelectForWrite();
+	if (write && bKqueueArmWrite)
+		MyEventMachine->Modify (this);
 	#endif
 }
 
@@ -473,7 +501,7 @@ ConnectionDescriptor::SetAttached
 
 void ConnectionDescriptor::SetAttached(bool state)
 {
-   bAttached = state;
+	bAttached = state;
 }
 
 
@@ -555,7 +583,7 @@ void ConnectionDescriptor::SetNotifyWritable(bool writable)
 ConnectionDescriptor::SendOutboundData
 **************************************/
 
-int ConnectionDescriptor::SendOutboundData (const char *data, int length)
+int ConnectionDescriptor::SendOutboundData (const char *data, unsigned long length)
 {
 	if (bWatchOnly)
 		throw std::runtime_error ("cannot send data on a 'watch only' connection");
@@ -566,11 +594,25 @@ int ConnectionDescriptor::SendOutboundData (const char *data, int length)
 	#ifdef WITH_SSL
 	if (SslBox) {
 		if (length > 0) {
-			int w = SslBox->PutPlaintext (data, length);
-			if (w < 0)
-				ScheduleClose (false);
-			else
-				_DispatchCiphertext();
+			unsigned long writed = 0;
+			char *p = (char*)data;
+
+			while (writed < length) {
+				int to_write = SSLBOX_INPUT_CHUNKSIZE;
+				int remaining = length - writed;
+
+				if (remaining < SSLBOX_INPUT_CHUNKSIZE)
+					to_write = remaining;
+
+				int w = SslBox->PutPlaintext (p, to_write);
+				if (w < 0) {
+					ScheduleClose (false);
+				}else
+					_DispatchCiphertext();
+
+				p += to_write;
+				writed += to_write;
+			}
 		}
 		// TODO: What's the correct return value?
 		return 1; // That's a wild guess, almost certainly wrong.
@@ -586,7 +628,7 @@ int ConnectionDescriptor::SendOutboundData (const char *data, int length)
 ConnectionDescriptor::_SendRawOutboundData
 ******************************************/
 
-int ConnectionDescriptor::_SendRawOutboundData (const char *data, int length)
+int ConnectionDescriptor::_SendRawOutboundData (const char *data, unsigned long length)
 {
 	/* This internal method is called to schedule bytes that
 	 * will be sent out to the remote peer.
@@ -602,7 +644,6 @@ int ConnectionDescriptor::_SendRawOutboundData (const char *data, int length)
 
 	if (IsCloseScheduled())
 		return 0;
-
 	// 25Mar10: Ignore 0 length packets as they are not meaningful in TCP (as opposed to UDP)
 	// and can cause the assert(nbytes>0) to fail when OutboundPages has a bunch of 0 length pages.
 	if (length == 0)
@@ -632,28 +673,28 @@ ConnectionDescriptor::SelectForRead
 
 bool ConnectionDescriptor::SelectForRead()
 {
-  /* A connection descriptor is always scheduled for read,
-   * UNLESS it's in a pending-connect state.
-   * On Linux, unlike Unix, a nonblocking socket on which
-   * connect has been called, does NOT necessarily select
-   * both readable and writable in case of error.
-   * The socket will select writable when the disposition
-   * of the connect is known. On the other hand, a socket
-   * which successfully connects and selects writable may
-   * indeed have some data available on it, so it will
-   * select readable in that case, violating expectations!
-   * So we will not poll for readability until the socket
-   * is known to be in a connected state.
-   */
+	/* A connection descriptor is always scheduled for read,
+	 * UNLESS it's in a pending-connect state.
+	 * On Linux, unlike Unix, a nonblocking socket on which
+	 * connect has been called, does NOT necessarily select
+	 * both readable and writable in case of error.
+	 * The socket will select writable when the disposition
+	 * of the connect is known. On the other hand, a socket
+	 * which successfully connects and selects writable may
+	 * indeed have some data available on it, so it will
+	 * select readable in that case, violating expectations!
+	 * So we will not poll for readability until the socket
+	 * is known to be in a connected state.
+	 */
 
-  if (bPaused)
-    return false;
-  else if (bConnectPending)
-    return false;
-  else if (bWatchOnly)
-    return bNotifyReadable ? true : false;
-  else
-    return true;
+	if (bPaused)
+		return false;
+	else if (bConnectPending)
+		return false;
+	else if (bWatchOnly)
+		return bNotifyReadable ? true : false;
+	else
+		return true;
 }
 
 
@@ -663,20 +704,20 @@ ConnectionDescriptor::SelectForWrite
 
 bool ConnectionDescriptor::SelectForWrite()
 {
-  /* Cf the notes under SelectForRead.
-   * In a pending-connect state, we ALWAYS select for writable.
-   * In a normal state, we only select for writable when we
-   * have outgoing data to send.
-   */
+	/* Cf the notes under SelectForRead.
+	 * In a pending-connect state, we ALWAYS select for writable.
+	 * In a normal state, we only select for writable when we
+	 * have outgoing data to send.
+	 */
 
-  if (bPaused)
-    return false;
-  else if (bConnectPending)
-    return true;
-  else if (bWatchOnly)
-    return bNotifyWritable ? true : false;
-  else
-    return (GetOutboundDataSize() > 0);
+	if (bPaused)
+		return false;
+	else if (bConnectPending)
+		return true;
+	else if (bWatchOnly)
+		return bNotifyWritable ? true : false;
+	else
+		return (GetOutboundDataSize() > 0);
 }
 
 /***************************
@@ -738,7 +779,7 @@ void ConnectionDescriptor::Read()
 	 * come here more than once after being closed. (FCianfrocca)
 	 */
 
-	int sd = GetSocket();
+	SOCKET sd = GetSocket();
 	//assert (sd != INVALID_SOCKET); (original, removed 22Aug06)
 	if (sd == INVALID_SOCKET) {
 		assert (!bReadAttemptedAfterClose);
@@ -827,9 +868,9 @@ void ConnectionDescriptor::Read()
 ConnectionDescriptor::_DispatchInboundData
 ******************************************/
 
-void ConnectionDescriptor::_DispatchInboundData (const char *buffer, int size)
+#ifdef WITH_SSL
+void ConnectionDescriptor::_DispatchInboundData (const char *buffer, unsigned long size)
 {
-	#ifdef WITH_SSL
 	if (SslBox) {
 		SslBox->PutCiphertext (buffer, size);
 
@@ -843,6 +884,15 @@ void ConnectionDescriptor::_DispatchInboundData (const char *buffer, int size)
 
 		// If our SSL handshake had a problem, shut down the connection.
 		if (s == -2) {
+			#ifndef EPROTO // OpenBSD does not have EPROTO
+			#define EPROTO EINTR
+			#endif
+			#ifdef OS_UNIX
+			UnbindReasonCode = EPROTO;
+			#endif
+			#ifdef OS_WIN32
+			UnbindReasonCode = WSAECONNABORTED;
+			#endif
 			ScheduleClose(false);
 			return;
 		}
@@ -853,12 +903,13 @@ void ConnectionDescriptor::_DispatchInboundData (const char *buffer, int size)
 	else {
 		_GenericInboundDispatch(buffer, size);
 	}
-	#endif
-
-	#ifdef WITHOUT_SSL
-	_GenericInboundDispatch(buffer, size);
-	#endif
 }
+#else
+void ConnectionDescriptor::_DispatchInboundData (const char *buffer, unsigned long size)
+{
+	_GenericInboundDispatch(buffer, size);
+}
+#endif
 
 
 
@@ -940,7 +991,7 @@ void ConnectionDescriptor::Write()
 		   ::Write to be called in a busy-loop.
 		*/
 		#ifdef HAVE_KQUEUE
-		if (MyEventMachine->UsingKqueue()) {
+		if (MyEventMachine->GetPoller() == Poller_Kqueue) {
 			if (OutboundDataSize == 0 && !bGotExtraKqueueEvent) {
 				bGotExtraKqueueEvent = true;
 				return;
@@ -973,7 +1024,7 @@ void ConnectionDescriptor::_WriteOutboundData()
 	 * doing it to address some reports of crashing under heavy loads.
 	 */
 
-	int sd = GetSocket();
+	SOCKET sd = GetSocket();
 	//assert (sd != INVALID_SOCKET);
 	if (sd == INVALID_SOCKET) {
 		assert (!bWriteAttemptedAfterClose);
@@ -994,6 +1045,8 @@ void ConnectionDescriptor::_WriteOutboundData()
 	for(int i = 0; i < iovcnt; i++){
 		OutboundPage *op = &(OutboundPages[i]);
 		#ifdef CC_SUNWspro
+		// TODO: The void * cast works fine on Solaris 11, but
+		// I don't know at what point that changed from older Solaris.
 		iov[i].iov_base = (char *)(op->Buffer + op->Offset);
 		#else
 		iov[i].iov_base = (void *)(op->Buffer + op->Offset);
@@ -1135,42 +1188,57 @@ int ConnectionDescriptor::ReportErrorStatus()
 ConnectionDescriptor::StartTls
 ******************************/
 
+#ifdef WITH_SSL
 void ConnectionDescriptor::StartTls()
 {
-	#ifdef WITH_SSL
 	if (SslBox)
 		throw std::runtime_error ("SSL/TLS already running on connection");
 
-	SslBox = new SslBox_t (bIsServer, PrivateKeyFilename, CertChainFilename, bSslVerifyPeer, GetBinding());
+	SslBox = new SslBox_t (bIsServer, PrivateKeyFilename, CertChainFilename, bSslVerifyPeer, bSslFailIfNoPeerCert, SniHostName, CipherList, EcdhCurve, DhParam, Protocols, GetBinding());
 	_DispatchCiphertext();
-	#endif
 
-	#ifdef WITHOUT_SSL
-	throw std::runtime_error ("Encryption not available on this event-machine");
-	#endif
 }
+#else
+void ConnectionDescriptor::StartTls()
+{
+	throw std::runtime_error ("Encryption not available on this event-machine");
+}
+#endif
 
 
 /*********************************
 ConnectionDescriptor::SetTlsParms
 *********************************/
 
-void ConnectionDescriptor::SetTlsParms (const char *privkey_filename, const char *certchain_filename, bool verify_peer)
+#ifdef WITH_SSL
+void ConnectionDescriptor::SetTlsParms (const char *privkey_filename, const char *certchain_filename, bool verify_peer, bool fail_if_no_peer_cert, const char *sni_hostname, const char *cipherlist, const char *ecdh_curve, const char *dhparam, int protocols)
 {
-	#ifdef WITH_SSL
 	if (SslBox)
 		throw std::runtime_error ("call SetTlsParms before calling StartTls");
 	if (privkey_filename && *privkey_filename)
 		PrivateKeyFilename = privkey_filename;
 	if (certchain_filename && *certchain_filename)
 		CertChainFilename = certchain_filename;
-	bSslVerifyPeer = verify_peer;
-	#endif
+	bSslVerifyPeer     = verify_peer;
+	bSslFailIfNoPeerCert = fail_if_no_peer_cert;
 
-	#ifdef WITHOUT_SSL
-	throw std::runtime_error ("Encryption not available on this event-machine");
-	#endif
+	if (sni_hostname && *sni_hostname)
+		SniHostName = sni_hostname;
+	if (cipherlist && *cipherlist)
+		CipherList = cipherlist;
+	if (ecdh_curve && *ecdh_curve)
+		EcdhCurve = ecdh_curve;
+	if (dhparam && *dhparam)
+		DhParam = dhparam;
+
+	Protocols = protocols;
 }
+#else
+void ConnectionDescriptor::SetTlsParms (const char *privkey_filename UNUSED, const char *certchain_filename UNUSED, bool verify_peer UNUSED, bool fail_if_no_peer_cert UNUSED, const char *sni_hostname UNUSED, const char *cipherlist UNUSED, const char *ecdh_curve UNUSED, const char *dhparam UNUSED, int protocols UNUSED)
+{
+	throw std::runtime_error ("Encryption not available on this event-machine");
+}
+#endif
 
 
 /*********************************
@@ -1183,6 +1251,62 @@ X509 *ConnectionDescriptor::GetPeerCert()
 	if (!SslBox)
 		throw std::runtime_error ("SSL/TLS not running on this connection");
 	return SslBox->GetPeerCert();
+}
+#endif
+
+
+/*********************************
+ConnectionDescriptor::GetCipherBits
+*********************************/
+
+#ifdef WITH_SSL
+int ConnectionDescriptor::GetCipherBits()
+{
+	if (!SslBox)
+		throw std::runtime_error ("SSL/TLS not running on this connection");
+	return SslBox->GetCipherBits();
+}
+#endif
+
+
+/*********************************
+ConnectionDescriptor::GetCipherName
+*********************************/
+
+#ifdef WITH_SSL
+const char *ConnectionDescriptor::GetCipherName()
+{
+	if (!SslBox)
+		throw std::runtime_error ("SSL/TLS not running on this connection");
+	return SslBox->GetCipherName();
+}
+#endif
+
+
+/*********************************
+ConnectionDescriptor::GetCipherProtocol
+*********************************/
+
+#ifdef WITH_SSL
+const char *ConnectionDescriptor::GetCipherProtocol()
+{
+	if (!SslBox)
+		throw std::runtime_error ("SSL/TLS not running on this connection");
+	return SslBox->GetCipherProtocol();
+}
+#endif
+
+
+/*********************************
+ConnectionDescriptor::GetSNIHostname
+*********************************/
+
+#ifdef WITH_SSL
+const char *ConnectionDescriptor::GetSNIHostname()
+{
+	if (!SslBox)
+		throw std::runtime_error ("SSL/TLS not running on this connection");
+	return SslBox->GetSNIHostname();
 }
 #endif
 
@@ -1226,7 +1350,7 @@ void ConnectionDescriptor::_DispatchCiphertext()
 	assert (SslBox);
 
 
-	char BigBuf [2048];
+	char BigBuf [SSLBOX_OUTPUT_CHUNKSIZE];
 	bool did_work;
 
 	do {
@@ -1298,14 +1422,14 @@ void ConnectionDescriptor::Heartbeat()
 			UnbindReasonCode = ETIMEDOUT;
 			ScheduleClose (false);
 			//bCloseNow = true;
-    }
+		}
 	}
 	else {
 		if (InactivityTimeout && ((MyEventMachine->GetCurrentLoopTime() - LastActivity) >= InactivityTimeout)) {
 			UnbindReasonCode = ETIMEDOUT;
 			ScheduleClose (false);
 			//bCloseNow = true;
-    }
+		}
 	}
 }
 
@@ -1314,7 +1438,7 @@ void ConnectionDescriptor::Heartbeat()
 LoopbreakDescriptor::LoopbreakDescriptor
 ****************************************/
 
-LoopbreakDescriptor::LoopbreakDescriptor (int sd, EventMachine_t *parent_em):
+LoopbreakDescriptor::LoopbreakDescriptor (SOCKET sd, EventMachine_t *parent_em):
 	EventableDescriptor (sd, parent_em)
 {
 	/* This is really bad and ugly. Change someday if possible.
@@ -1353,15 +1477,15 @@ LoopbreakDescriptor::Write
 
 void LoopbreakDescriptor::Write()
 {
-  // Why are we here?
-  throw std::runtime_error ("bad code path in loopbreak");
+	// Why are we here?
+	throw std::runtime_error ("bad code path in loopbreak");
 }
 
 /**************************************
 AcceptorDescriptor::AcceptorDescriptor
 **************************************/
 
-AcceptorDescriptor::AcceptorDescriptor (int sd, EventMachine_t *parent_em):
+AcceptorDescriptor::AcceptorDescriptor (SOCKET sd, EventMachine_t *parent_em):
 	EventableDescriptor (sd, parent_em)
 {
 	#ifdef HAVE_EPOLL
@@ -1385,7 +1509,7 @@ AcceptorDescriptor::~AcceptorDescriptor()
 STATIC: AcceptorDescriptor::StopAcceptor
 ****************************************/
 
-void AcceptorDescriptor::StopAcceptor (const unsigned long binding)
+void AcceptorDescriptor::StopAcceptor (const uintptr_t binding)
 {
 	// TODO: This is something of a hack, or at least it's a static method of the wrong class.
 	AcceptorDescriptor *ad = dynamic_cast <AcceptorDescriptor*> (Bindable_t::GetObject (binding));
@@ -1418,9 +1542,19 @@ void AcceptorDescriptor::Read()
 
 	struct sockaddr_in pin;
 	socklen_t addrlen = sizeof (pin);
+	int accept_count = EventMachine_t::GetSimultaneousAcceptCount();
 
-	for (int i=0; i < 10; i++) {
-		int sd = accept (GetSocket(), (struct sockaddr*)&pin, &addrlen);
+	for (int i=0; i < accept_count; i++) {
+#if defined(HAVE_CONST_SOCK_CLOEXEC) && defined(HAVE_ACCEPT4)
+		SOCKET sd = accept4 (GetSocket(), (struct sockaddr*)&pin, &addrlen, SOCK_CLOEXEC);
+		if (sd == INVALID_SOCKET) {
+			// We may be running in a kernel where
+			// SOCK_CLOEXEC is not supported - fall back:
+			sd = accept (GetSocket(), (struct sockaddr*)&pin, &addrlen);
+		}
+#else
+		SOCKET sd = accept (GetSocket(), (struct sockaddr*)&pin, &addrlen);
+#endif
 		if (sd == INVALID_SOCKET) {
 			// This breaks the loop when we've accepted everything on the kernel queue,
 			// up to 10 new connections. But what if the *first* accept fails?
@@ -1429,17 +1563,16 @@ void AcceptorDescriptor::Read()
 			break;
 		}
 
-		// Set the newly-accepted socket non-blocking.
+		// Set the newly-accepted socket non-blocking and to close on exec.
 		// On Windows, this may fail because, weirdly, Windows inherits the non-blocking
 		// attribute that we applied to the acceptor socket into the accepted one.
-		if (!SetSocketNonblocking (sd)) {
+		if (!SetFdCloexec(sd) || !SetSocketNonblocking (sd)) {
 		//int val = fcntl (sd, F_GETFL, 0);
 		//if (fcntl (sd, F_SETFL, val | O_NONBLOCK) == -1) {
 			shutdown (sd, 1);
 			close (sd);
 			continue;
 		}
-
 
 		// Disable slow-start (Nagle algorithm). Eventually make this configurable.
 		int one = 1;
@@ -1454,14 +1587,18 @@ void AcceptorDescriptor::Read()
 			(*EventCallback) (GetBinding(), EM_CONNECTION_ACCEPTED, NULL, cd->GetBinding());
 		}
 		#ifdef HAVE_EPOLL
-		cd->GetEpollEvent()->events =
-			(cd->SelectForRead() ? EPOLLIN : 0) | (cd->SelectForWrite() ? EPOLLOUT : 0);
+		cd->GetEpollEvent()->events = 0;
+		if (cd->SelectForRead())
+			cd->GetEpollEvent()->events |= EPOLLIN;
+		if (cd->SelectForWrite())
+			cd->GetEpollEvent()->events |= EPOLLOUT;
 		#endif
 		assert (MyEventMachine);
 		MyEventMachine->Add (cd);
 		#ifdef HAVE_KQUEUE
-		if (cd->SelectForWrite())
-			MyEventMachine->ArmKqueueWriter (cd);
+		bKqueueArmWrite = cd->SelectForWrite();
+		if (bKqueueArmWrite)
+			MyEventMachine->Modify (cd);
 		if (cd->SelectForRead())
 			MyEventMachine->ArmKqueueReader (cd);
 		#endif
@@ -1476,8 +1613,8 @@ AcceptorDescriptor::Write
 
 void AcceptorDescriptor::Write()
 {
-  // Why are we here?
-  throw std::runtime_error ("bad code path in acceptor");
+	// Why are we here?
+	throw std::runtime_error ("bad code path in acceptor");
 }
 
 
@@ -1487,7 +1624,7 @@ AcceptorDescriptor::Heartbeat
 
 void AcceptorDescriptor::Heartbeat()
 {
-  // No-op
+	// No-op
 }
 
 
@@ -1512,7 +1649,7 @@ bool AcceptorDescriptor::GetSockname (struct sockaddr *s, socklen_t *len)
 DatagramDescriptor::DatagramDescriptor
 **************************************/
 
-DatagramDescriptor::DatagramDescriptor (int sd, EventMachine_t *parent_em):
+DatagramDescriptor::DatagramDescriptor (SOCKET sd, EventMachine_t *parent_em):
 	EventableDescriptor (sd, parent_em),
 	OutboundDataSize (0)
 {
@@ -1580,7 +1717,7 @@ DatagramDescriptor::Read
 
 void DatagramDescriptor::Read()
 {
-	int sd = GetSocket();
+	SOCKET sd = GetSocket();
 	assert (sd != INVALID_SOCKET);
 	LastActivity = MyEventMachine->GetCurrentLoopTime();
 
@@ -1657,7 +1794,7 @@ void DatagramDescriptor::Write()
 	 * TODO, we are currently suppressing the EMSGSIZE error!!!
 	 */
 
-	int sd = GetSocket();
+	SOCKET sd = GetSocket();
 	assert (sd != INVALID_SOCKET);
 	LastActivity = MyEventMachine->GetCurrentLoopTime();
 
@@ -1670,7 +1807,8 @@ void DatagramDescriptor::Write()
 		OutboundPage *op = &(OutboundPages[0]);
 
 		// The nasty cast to (char*) is needed because Windows is brain-dead.
-		int s = sendto (sd, (char*)op->Buffer, op->Length, 0, (struct sockaddr*)&(op->From), sizeof(op->From));
+		int s = sendto (sd, (char*)op->Buffer, op->Length, 0, (struct sockaddr*)&(op->From),
+		               (op->From.sin6_family == AF_INET6 ? sizeof (struct sockaddr_in6) : sizeof (struct sockaddr_in)));
 #ifdef OS_WIN32
 		int e = WSAGetLastError();
 #else
@@ -1696,13 +1834,16 @@ void DatagramDescriptor::Write()
 	}
 
 	#ifdef HAVE_EPOLL
-	EpollEvent.events = (EPOLLIN | (SelectForWrite() ? EPOLLOUT : 0));
+	EpollEvent.events = EPOLLIN;
+	if (SelectForWrite())
+		EpollEvent.events |= EPOLLOUT;
 	assert (MyEventMachine);
 	MyEventMachine->Modify (this);
 	#endif
 	#ifdef HAVE_KQUEUE
-	if (SelectForWrite())
-		MyEventMachine->ArmKqueueWriter (this);
+	bKqueueArmWrite = SelectForWrite();
+	assert (MyEventMachine);
+	MyEventMachine->Modify (this);
 	#endif
 }
 
@@ -1728,7 +1869,7 @@ bool DatagramDescriptor::SelectForWrite()
 DatagramDescriptor::SendOutboundData
 ************************************/
 
-int DatagramDescriptor::SendOutboundData (const char *data, int length)
+int DatagramDescriptor::SendOutboundData (const char *data, unsigned long length)
 {
 	// This is almost an exact clone of ConnectionDescriptor::_SendRawOutboundData.
 	// That means most of it could be factored to a common ancestor. Note that
@@ -1753,7 +1894,9 @@ int DatagramDescriptor::SendOutboundData (const char *data, int length)
 	MyEventMachine->Modify (this);
 	#endif
 	#ifdef HAVE_KQUEUE
-	MyEventMachine->ArmKqueueWriter (this);
+	bKqueueArmWrite = true;
+	assert (MyEventMachine);
+	MyEventMachine->Modify (this);
 	#endif
 
 	return length;
@@ -1764,7 +1907,7 @@ int DatagramDescriptor::SendOutboundData (const char *data, int length)
 DatagramDescriptor::SendOutboundDatagram
 ****************************************/
 
-int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, const char *address, int port)
+int DatagramDescriptor::SendOutboundDatagram (const char *data, unsigned long length, const char *address, int port)
 {
 	// This is an exact clone of ConnectionDescriptor::SendOutboundData.
 	// That means it needs to move to a common ancestor.
@@ -1777,23 +1920,10 @@ int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, cons
 	if (!address || !*address || !port)
 		return 0;
 
-	sockaddr_in pin;
-	unsigned long HostAddr;
-
-	HostAddr = inet_addr (address);
-	if (HostAddr == INADDR_NONE) {
-		// The nasty cast to (char*) is because Windows is brain-dead.
-		hostent *hp = gethostbyname ((char*)address);
-		if (!hp)
-			return 0;
-		HostAddr = ((in_addr*)(hp->h_addr))->s_addr;
-	}
-
-	memset (&pin, 0, sizeof(pin));
-	pin.sin_family = AF_INET;
-	pin.sin_addr.s_addr = HostAddr;
-	pin.sin_port = htons (port);
-
+	struct sockaddr_in6 addr_here;
+	size_t addr_here_len = sizeof addr_here;
+	if (!EventMachine_t::name2address (address, port, (struct sockaddr *)&addr_here, &addr_here_len))
+		return -1;
 
 	if (!data && (length > 0))
 		throw std::runtime_error ("bad outbound data");
@@ -1802,7 +1932,7 @@ int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, cons
 		throw std::runtime_error ("no allocation for outbound data");
 	memcpy (buffer, data, length);
 	buffer [length] = 0;
-	OutboundPages.push_back (OutboundPage (buffer, length, pin));
+	OutboundPages.push_back (OutboundPage (buffer, length, addr_here));
 	OutboundDataSize += length;
 
 	#ifdef HAVE_EPOLL
@@ -1811,7 +1941,9 @@ int DatagramDescriptor::SendOutboundDatagram (const char *data, int length, cons
 	MyEventMachine->Modify (this);
 	#endif
 	#ifdef HAVE_KQUEUE
-	MyEventMachine->ArmKqueueWriter (this);
+	bKqueueArmWrite = true;
+	assert (MyEventMachine);
+	MyEventMachine->Modify (this);
 	#endif
 
 	return length;
